@@ -23,6 +23,7 @@ import zio.stacktracer.TracingImplicits.disableAutoTrace
 
 import java.nio.charset.{Charset, StandardCharsets}
 import java.util.concurrent.atomic.AtomicReference
+import scala.annotation.tailrec
 import scala.reflect.ClassTag
 
 final class ZSink[-R, +E, -In, +L, +Z] private (val channel: ZChannel[R, ZNothing, Chunk[In], Any, E, Chunk[L], Z])
@@ -318,8 +319,20 @@ final class ZSink[-R, +E, -In, +L, +Z] private (val channel: ZChannel[R, ZNothin
     failure: E => ZSink[R1, E2, In1, L1, Z1],
     success: Z => ZSink[R1, E2, In1, L1, Z1]
   )(implicit ev: L <:< In1, trace: Trace): ZSink[R1, E2, In1, L1, Z1] =
+    this.foldCauseSink(
+      _.failureOrCause match {
+        case Left(err) => failure(err)
+        case Right(c)  => ZSink.failCause(c)
+      },
+      success
+    )
+
+  def foldCauseSink[R1 <: R, E2, In1 <: In, L1 >: L <: In1, Z1](
+    failure: Cause[E] => ZSink[R1, E2, In1, L1, Z1],
+    success: Z => ZSink[R1, E2, In1, L1, Z1]
+  )(implicit ev: L <:< In1, trace: Trace): ZSink[R1, E2, In1, L1, Z1] =
     new ZSink(
-      channel.collectElements.foldChannel(
+      channel.collectElements.foldCauseChannel(
         failure(_).channel,
         { case (leftovers, z) =>
           ZChannel.suspend {
@@ -379,7 +392,7 @@ final class ZSink[-R, +E, -In, +L, +Z] private (val channel: ZChannel[R, ZNothin
     new ZSink(channel.mapZIO(f))
 
   /** Switch to another sink in case of failure */
-  def orElse[R1 <: R, In1 <: In, E2 >: E, L1 >: L, Z1 >: Z](
+  def orElse[R1 <: R, In1 <: In, E2, L1 >: L, Z1 >: Z](
     that: => ZSink[R1, E2, In1, L1, Z1]
   )(implicit trace: Trace): ZSink[R1, E2, In1, L1, Z1] =
     new ZSink[R1, E2, In1, L1, Z1](self.channel.orElse(that.channel))
@@ -392,6 +405,38 @@ final class ZSink[-R, +E, -In, +L, +Z] private (val channel: ZChannel[R, ZNothin
     r: => ZEnvironment[R]
   )(implicit trace: Trace): ZSink[Any, E, In, L, Z] =
     new ZSink(channel.provideEnvironment(r))
+
+  /**
+   * Transforms the environment being provided to the sink with the specified
+   * function.
+   */
+  def provideSomeEnvironment[R0](
+    f: ZEnvironment[R0] => ZEnvironment[R]
+  )(implicit trace: Trace): ZSink[R0, E, In, L, Z] =
+    new ZSink(channel.provideSomeEnvironment(f))
+
+  /**
+   * Provides a layer to the sink, which translates it to another level.
+   */
+  def provideLayer[E1 >: E, R0](
+    layer: => ZLayer[R0, E1, R]
+  )(implicit trace: Trace): ZSink[R0, E1, In, L, Z] =
+    new ZSink(channel.provideLayer(layer))
+
+  /**
+   * Splits the environment into two parts, providing one part using the
+   * specified layer and leaving the remainder `R0`.
+   *
+   * {{{
+   * val loggingLayer: ZLayer[Any, Nothing, Logging] = ???
+   *
+   * val sink: ZSink[Logging with Database, Nothing, Unit] = ???
+   *
+   * val sink2 = sink.provideSomeLayer[Database](loggingLayer)
+   * }}}
+   */
+  def provideSomeLayer[R0]: ZSink.ProvideSomeLayer[R0, R, E, In, L, Z] =
+    new ZSink.ProvideSomeLayer[R0, R, E, In, L, Z](self.channel)
 
   /**
    * Runs both sinks in parallel on the input, , returning the result or the
@@ -429,13 +474,14 @@ final class ZSink[-R, +E, -In, +L, +Z] private (val channel: ZChannel[R, ZNothin
     val scoped =
       for {
         hub   <- Hub.bounded[Either[Exit[Nothing, Any], Chunk[In1]]](capacity)
-        c1    <- ZChannel.fromHubScoped(hub)
-        c2    <- ZChannel.fromHubScoped(hub)
+        s1    <- hub.subscribe
+        s2    <- hub.subscribe
         reader = ZChannel.toHub[Nothing, Any, Chunk[In1]](hub)
-        writer = (c1 >>> self.channel).mergeWith(c2 >>> that.channel)(
-                   leftDone,
-                   rightDone
-                 )
+        writer = (ZChannel.fromQueue(s1) >>> self.channel <* ZChannel.fromZIO(s1.shutdown))
+                   .mergeWith((ZChannel.fromQueue(s2) >>> that.channel <* ZChannel.fromZIO(s2.shutdown)))(
+                     leftDone,
+                     rightDone
+                   )
         channel = reader.mergeWith(writer)(
                     _ => ZChannel.MergeDecision.await(ZIO.done(_)),
                     done => ZChannel.MergeDecision.done(ZIO.done(done))
@@ -889,19 +935,15 @@ object ZSink extends ZSinkPlatformSpecificConstructors {
     z: => S
   )(contFn: S => Boolean)(f: (S, In) => S)(implicit trace: Trace): ZSink[Any, Nothing, In, In, S] =
     ZSink.suspend {
-      def foldChunkSplit(z: S, chunk: Chunk[In])(
-        contFn: S => Boolean
-      )(f: (S, In) => S): (S, Chunk[In]) = {
+      def foldChunkSplit(z: S, chunk: Chunk[In]): (S, Chunk[In]) = {
+        @tailrec
         def fold(s: S, chunk: Chunk[In], idx: Int, len: Int): (S, Chunk[In]) =
-          if (idx == len) {
-            (s, Chunk.empty)
-          } else {
+          if (idx == len) (s, Chunk.empty)
+          else {
             val s1 = f(s, chunk(idx))
-            if (contFn(s1)) {
-              fold(s1, chunk, idx + 1, len)
-            } else {
-              (s1, chunk.drop(idx + 1))
-            }
+
+            if (contFn(s1)) fold(s1, chunk, idx + 1, len)
+            else (s1, chunk.drop(idx + 1))
           }
 
         fold(z, chunk, 0, chunk.length)
@@ -912,13 +954,13 @@ object ZSink extends ZSinkPlatformSpecificConstructors {
         else
           ZChannel.readWithCause(
             (in: Chunk[In]) => {
-              val (nextS, leftovers) = foldChunkSplit(s, in)(contFn)(f)
+              val (nextS, leftovers) = foldChunkSplit(s, in)
 
               if (leftovers.nonEmpty) ZChannel.write(leftovers).as(nextS)
               else reader(nextS)
             },
             (err: Cause[ZNothing]) => ZChannel.refailCause(err),
-            (x: Any) => ZChannel.succeedNow(s)
+            (_: Any) => ZChannel.succeedNow(s)
           )
 
       new ZSink(reader(z))
@@ -1006,8 +1048,8 @@ object ZSink extends ZSinkPlatformSpecificConstructors {
    */
   def foldLeftZIO[R, Err, In, S](z: => S)(
     f: (S, In) => ZIO[R, Err, S]
-  )(implicit trace: Trace): ZSink[R, Err, In, In, S] =
-    foldZIO[R, Err, In, S](z)(_ => true)(f)
+  )(implicit trace: Trace): ZSink[R, Err, In, Nothing, S] =
+    foldZIO[R, Err, In, S](z)(_ => true)(f).ignoreLeftover
 
   /**
    * Creates a sink that folds elements of type `In` into a structure of type
@@ -1754,5 +1796,22 @@ object ZSink extends ZSinkPlatformSpecificConstructors {
       trace: Trace
     ): ZSink[R, E, In, L, Z] =
       new ZSink(ZChannel.unwrapScoped[R](scoped.map(_.channel)))
+  }
+
+  final class ProvideSomeLayer[R0, -R, +E, -In, +L, +Z](
+    private val channel: ZChannel[R, ZNothing, Chunk[In], Any, E, Chunk[L], Z]
+  ) extends AnyVal {
+    def apply[E1 >: E, R1](
+      layer: => ZLayer[R0, E1, R1]
+    )(implicit
+      ev: R0 with R1 <:< R,
+      tagged: EnvironmentTag[R1],
+      trace: Trace
+    ): ZSink[R0, E1, In, L, Z] =
+      new ZSink(
+        channel
+          .asInstanceOf[ZChannel[R0 with R1, ZNothing, Chunk[In], Any, E, Chunk[L], Z]]
+          .provideLayer(ZLayer.environment[R0] ++ layer)
+      )
   }
 }

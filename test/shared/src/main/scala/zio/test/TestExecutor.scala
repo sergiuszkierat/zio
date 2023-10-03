@@ -42,18 +42,10 @@ object TestExecutor {
       ): UIO[Summary] =
         (for {
           sink     <- ZIO.service[ExecutionEventSink]
-          summary  <- Ref.make[Summary](Summary.empty)
           topParent = SuiteId.global
           _ <- {
-            def processEvent(
-              event: ExecutionEvent
-            ) =
-              summary.update(
-                _.add(event)
-              ) *>
-                sink.process(
-                  event
-                ) *> eventHandlerZ.handle(event)
+            def processEvent(event: ExecutionEvent) =
+              sink.process(event) *> eventHandlerZ.handle(event)
 
             def loop(
               labels: List[String],
@@ -70,17 +62,29 @@ object TestExecutor {
                   loop(label :: labels, spec, exec, ancestors, sectionId)
 
                 case Spec.ScopedCase(managed) =>
-                  ZIO
-                    .scoped(
-                      managed
-                        .flatMap(loop(labels, _, exec, ancestors, sectionId))
-                    )
-                    .catchAllCause { e =>
-                      val event =
-                        ExecutionEvent.RuntimeFailure(sectionId, labels, TestFailure.Runtime(e), ancestors)
+                  Scope.make.flatMap { scope =>
+                    scope
+                      .extend(managed.flatMap(loop(labels, _, exec, ancestors, sectionId)))
+                      .onExit { exit =>
+                        val warning =
+                          "Warning: ZIO Test is attempting to close the scope of suite " +
+                            s"${labels.reverse.mkString(" - ")} in $fullyQualifiedName, " +
+                            "but closing the scope has taken more than 60 seconds to " +
+                            "complete. This may indicate a resource leak."
+                        for {
+                          warning <-
+                            ZIO.logWarning(warning).delay(60.seconds).withClock(ClockLive).interruptible.forkDaemon
+                          finalizer <- scope.close(exit).ensuring(warning.interrupt).forkDaemon
+                          exit      <- warning.await
+                          _         <- finalizer.join.when(exit.isInterrupted)
+                        } yield ()
+                      }
+                  }.catchAllCause { e =>
+                    val event =
+                      ExecutionEvent.RuntimeFailure(sectionId, labels, TestFailure.Runtime(e), ancestors)
 
-                      processEvent(event)
-                    }
+                    processEvent(event)
+                  }
 
                 case Spec.MultipleCase(specs) =>
                   ZIO.uninterruptibleMask(restore =>
@@ -116,7 +120,7 @@ object TestExecutor {
                           fullyQualifiedName
                         )
                       )
-                    result  <- ZIO.withClock(ClockLive)(test.timed.either)
+                    result  <- Live.withLive(test)(_.timed).either
                     duration = result.map(_._1.toMillis).fold(_ => 1L, identity)
                     event =
                       ExecutionEvent
@@ -167,7 +171,7 @@ object TestExecutor {
               } *> processEvent(topLevelFlush) *> TestDebug.deleteIfEmpty(fullyQualifiedName)
 
           }
-          summary <- summary.get
+          summary <- sink.getSummary
         } yield summary).provideLayer(sinkLayer)
 
       private def extractAnnotations(result: Either[TestFailure[E], TestSuccess]) =

@@ -347,8 +347,8 @@ object FiberRef {
    */
   def make[A](
     initial: => A,
-    fork: A => A = (a: A) => a,
-    join: (A, A) => A = ((_: A, a: A) => a)
+    fork: A => A = ZIO.identityFn[A],
+    join: (A, A) => A = ZIO.secondFn[A]
   )(implicit trace: Trace): ZIO[Scope, Nothing, FiberRef[A]] =
     makeWith(unsafe.make(initial, fork, join)(Unsafe.unsafe))
 
@@ -361,6 +361,17 @@ object FiberRef {
     trace: Trace
   ): ZIO[Scope, Nothing, FiberRef.WithPatch[ZEnvironment[A], ZEnvironment.Patch[A, A]]] =
     makeWith(unsafe.makeEnvironment(initial)(Unsafe.unsafe))
+
+  /**
+   * Creates a new `FiberRef` with the specified initial value, using the
+   * specified patch type to combine updates to the value in a compositional
+   * way.
+   */
+  def makePatch[Value, Patch](
+    initial: Value,
+    differ: Differ[Value, Patch]
+  )(implicit trace: Trace): ZIO[Scope, Nothing, FiberRef.WithPatch[Value, Patch]] =
+    makePatch(initial, differ, differ.empty)
 
   /**
    * Creates a new `FiberRef` with the specified initial value, using the
@@ -388,7 +399,7 @@ object FiberRef {
     def make[A](
       initial: A,
       fork: A => A = ZIO.identityFn[A],
-      join: (A, A) => A = ((_: A, a: A) => a)
+      join: (A, A) => A = ZIO.secondFn[A]
     )(implicit unsafe: Unsafe): FiberRef.WithPatch[A, A => A] =
       makePatch[A, A => A](
         initial,

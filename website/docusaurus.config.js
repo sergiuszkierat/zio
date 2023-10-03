@@ -17,6 +17,7 @@ const config = {
   organizationName: 'zio',
   projectName: 'zio',
   themeConfig: {
+    image: 'https://zio.dev/img/zio.png',
     algolia: {
       // The application ID provided by Algolia
       appId: 'IAX8GRSWEQ',
@@ -55,11 +56,18 @@ const config = {
         { type: 'doc', docId: 'ecosystem/index', label: 'Ecosystem', position: 'left' },
         { type: 'doc', docId: 'resources/index', label: 'Resources', position: 'left' },
         { type: 'doc', docId: 'events/index', label: 'Events', position: 'left' },
+        { to: "http://chat.zio.dev", label: "Chat Bot", position: 'right' },
         { to: 'blog', label: 'Blog', position: 'right' },
         {
           type: 'docsVersionDropdown',
           position: 'right',
           dropdownActiveClassDisabled: true,
+        }, 
+        {
+          href: 'https://github.com/zio/zio',
+          position: 'right',
+          className: 'header-github-link',
+          'aria-label': 'GitHub repository',
         }
       ],
     },
@@ -160,17 +168,20 @@ const config = {
       '@docusaurus/preset-classic',
       {
         debug: true,
+        theme: {
+          customCss: [require.resolve('./src/css/custom.css')],
+        },
         docs: {
           routeBasePath: '/',
           sidebarPath: require.resolve('./sidebars.js'),
           lastVersion: 'current',
           versions: {
             'current': {
-              label: 'ZIO 2.x'
+              label: '2.0.x'
             },
-            '1.x': {
-              label: 'ZIO 1.x',
-              path: 'version-1.x'
+            '1.0.18': {
+              label: '1.0.18',
+              path: '1.0.18'
             }
           },
           remarkPlugins: [
@@ -196,6 +207,17 @@ const config = {
     ],
   ],
   plugins: [
+    async function myPlugin(context, options) {
+      return {
+        name: "docusaurus-tailwindcss",
+        configurePostCss(postcssOptions) {
+          // Appends TailwindCSS and AutoPrefixer.
+          postcssOptions.plugins.push(require("tailwindcss"));
+          postcssOptions.plugins.push(require("autoprefixer"));
+          return postcssOptions;
+        },
+      };
+    },
     [path.join(__dirname, './plugins/zio-ecosystem-docusaurus'), {}],
   ],
   markdown: {

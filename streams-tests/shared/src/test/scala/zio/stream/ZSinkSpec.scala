@@ -570,6 +570,29 @@ object ZSinkSpec extends ZIOBaseSpec {
               .fail("boom")
               .foldSink(err => ZSink.collectAll[Int].map(c => (c, err)), _ => sys.error("impossible"))
           assertZIO(ZStream(1, 2, 3).run(s))(equalTo((Chunk(1, 2, 3), "boom")))
+        },
+        test("foldSink over a dying sink") {
+          case object Death extends RuntimeException("not today!")
+          val dyingSink: ZSink[Any, Nothing, Any, Nothing, Nothing] = ZSink.failCause(Cause.die(Death))
+          val foldedSink: ZSink[Any, String, Any, Nothing, String] = dyingSink
+            .foldSink(
+              _ => ZSink.fail("it's a fail"),
+              _ => ZSink.succeed("it's a success")
+            )
+
+          val ex = ZStream
+            .range(0, 40, 10)
+            .run(foldedSink)
+            .exit
+
+          ex.map { ex1 =>
+            assertTrue {
+              ex1.isFailure &&
+              ex1.causeOption.flatMap(_.dieOption) ==
+                Some(Death)
+            }
+          }
+
         }
       ),
       suite("refine")(
@@ -761,7 +784,14 @@ object ZSinkSpec extends ZIOBaseSpec {
             assertZIO(ZStream(1, 2, 3).run(ZSink.head.zipParLeft(ZSink.succeed("Hello"))))(
               equalTo(Some(1))
             )
-          })
+          }),
+          test("early termination") {
+            val stream = ZStream.range(0, 1000, 1)
+            val sink   = ZSink.drain <&> ZSink.succeed(20)
+            for {
+              _ <- stream.run(sink)
+            } yield assertCompletes
+          }
         ),
         suite("splitWhere")(
           test("should split a stream on predicate and run each part into the sink") {
@@ -949,7 +979,111 @@ object ZSinkSpec extends ZIOBaseSpec {
             _ <- TestClock.adjust(100.millis)
             r <- f.join
           } yield assert(r)(isGreaterThanEqualTo(100.millis))
-        }
+        },
+        suite("provide")(
+          suite("provideEnvironment")(
+            test("simple") {
+              assertZIO(
+                ZStream.unit.run(
+                  ZSink.service[Int].provideEnvironment(ZEnvironment(100))
+                )
+              )(equalTo(100))
+            },
+            test("provide <*> provide") {
+              assertZIO(
+                ZStream.unit.run(ZSink.service[Int].provideEnvironment(ZEnvironment(100))) <*>
+                  ZStream.unit.run(ZSink.service[Int].provideEnvironment(ZEnvironment(200)))
+              )(equalTo((100, 200)))
+            },
+            test("provide is modular") {
+              assertZIO(
+                ZStream.unit
+                  .run(for {
+                    v1 <- ZSink.service[Int]
+                    v2 <- ZSink.service[Int].provideEnvironment(ZEnvironment(2))
+                    v3 <- ZSink.service[Int]
+                  } yield (v1, v2, v3))
+                  .provideEnvironment(ZEnvironment(4))
+              )(equalTo((4, 2, 4)))
+            }
+          ),
+          suite("provideSomeEnvironment")(
+            test("simple") {
+              assertZIO(
+                ZStream.unit.run(
+                  ZSink.service[Int].provideSomeEnvironment[Any](_ => ZEnvironment(100))
+                )
+              )(equalTo(100))
+            },
+            test("provideSome <*> provideSome") {
+              assertZIO(
+                ZStream.unit.run(ZSink.service[Int].provideSomeEnvironment[Any](_ => ZEnvironment(100))) <*>
+                  ZStream.unit.run(ZSink.service[Int].provideSomeEnvironment[Any](_ => ZEnvironment(200)))
+              )(equalTo((100, 200)))
+            },
+            test("provideSome is modular") {
+              assertZIO(
+                ZStream.unit
+                  .run(for {
+                    v1 <- ZSink.service[Int]
+                    v2 <- ZSink.service[Int].provideSomeEnvironment[Any](_ => ZEnvironment(2))
+                    v3 <- ZSink.service[Int]
+                  } yield (v1, v2, v3))
+                  .provideSomeEnvironment[Any](_ => ZEnvironment(4))
+              )(equalTo((4, 2, 4)))
+            }
+          ),
+          suite("provideLayer")(
+            test("simple") {
+              assertZIO(
+                ZStream.unit.run(ZSink.service[Int].provideLayer(ZLayer.succeed(1)))
+              )(equalTo(1))
+            },
+            test("provideLayer <*> provideLayer") {
+              assertZIO(
+                ZStream.unit.run(ZSink.service[Int].provideLayer(ZLayer.succeed(100))) <*>
+                  ZStream.unit.run(ZSink.service[Int].provideLayer(ZLayer.succeed(200)))
+              )(equalTo((100, 200)))
+            },
+            test("provideLayer is modular") {
+              assertZIO(
+                ZStream.unit
+                  .run(for {
+                    v1 <- ZSink.service[Int]
+                    v2 <- ZSink.service[Int].provideLayer(ZLayer.succeed(2))
+                    v3 <- ZSink.service[Int]
+                  } yield (v1, v2, v3))
+                  .provideLayer(ZLayer.succeed(4))
+              )(equalTo((4, 2, 4)))
+            }
+          ),
+          suite("provideSomeLayer")(
+            test("simple") {
+              assertZIO(
+                ZStream.unit.run(
+                  ZSink.service[Int].provideSomeLayer[Any](ZLayer.succeed(100))
+                )
+              )(equalTo(100))
+            },
+            test("provideSome <*> provideSome") {
+              assertZIO(
+                ZStream.unit.run(ZSink.service[Int].provideSomeLayer[Any](ZLayer.succeed(100))) <*>
+                  ZStream.unit.run(ZSink.service[Int].provideSomeLayer[Any](ZLayer.succeed(200)))
+              )(equalTo((100, 200)))
+            },
+            test("provideSome is modular") {
+              assertZIO(
+                ZStream.unit
+                  .run(for {
+                    v1 <- ZSink.service[Int]
+                    v2 <- ZSink.service[Int].provideSomeLayer[Any](ZLayer.succeed(2))
+                    v3 <- ZSink.service[Int]
+                  } yield (v1, v2, v3))
+                  .provideSomeLayer[Any](ZLayer.succeed(4))
+              )(equalTo((4, 2, 4)))
+            }
+          )
+        )
       ),
       test("error propagation") {
         case object ErrorStream

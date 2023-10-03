@@ -2386,6 +2386,16 @@ object ZIOSpec extends ZIOBaseSpec {
           _     <- end.await
         } yield assertCompletes
       },
+      test("timeout does not allow interruption to be observed in uninterruptible region") {
+        ZIO.uninterruptible {
+          for {
+            promise <- Promise.make[Nothing, Unit]
+            fiber   <- (promise.succeed(()) *> ZIO.sleep(2.second).timeout(1.seconds)).fork
+            _       <- promise.await
+            exit    <- fiber.interrupt
+          } yield assert(exit)(not(isInterrupted))
+        }
+      } @@ TestAspect.withLiveClock,
       test("catchAllCause") {
         val io =
           for {
@@ -4183,6 +4193,16 @@ object ZIOSpec extends ZIOBaseSpec {
       test("propagates interruption") {
         val zio = ZIO.never <&> ZIO.never <&> ZIO.fail("fail")
         assertZIO(zio.exit)(fails(equalTo("fail")))
+      },
+      test("propagates FiberRef values") {
+        for {
+          fiberRef <- FiberRef.make(5)
+          workflow  = fiberRef.set(10).delay(2.seconds) <&> fiberRef.set(15)
+          fiber    <- workflow.fork
+          _        <- TestClock.adjust(2.seconds)
+          _        <- fiber.join
+          value    <- fiberRef.get
+        } yield assertTrue(value == 10)
       }
     ),
     suite("toFuture")(
@@ -4248,11 +4268,11 @@ object ZIOSpec extends ZIOBaseSpec {
         }
       },
       test("promise ugly path test") {
-        val func: String => String = s => s.toUpperCase
+        val func: String => String = _ => throw new Exception("side-effect")
         for {
           promise <- ZIO.succeed(scala.concurrent.Promise[String]())
           _ <- ZIO.attempt {
-                 Try(func(null)) match {
+                 Try(func("hello world from future")) match {
                    case Success(value)     => promise.success(value)
                    case Failure(exception) => promise.failure(exception)
                  }
@@ -4279,7 +4299,23 @@ object ZIOSpec extends ZIOBaseSpec {
       for {
         cause <- ZIO.fail(new RuntimeException("fail")).ensuring(ZIO.die(new RuntimeException("die"))).orDie.cause
       } yield assertTrue(cause.size == 2)
-    }
+    },
+    suite("ignore")(
+      test("ignores successes") {
+        var evaluated = false
+        val workflow  = ZIO.ignore { evaluated = true }
+        for {
+          _ <- workflow
+        } yield assertTrue(evaluated)
+      },
+      test("ignores failures") {
+        var evaluated = false
+        val workflow  = ZIO.ignore { evaluated = true; throw new Exception("fail") }
+        for {
+          _ <- workflow
+        } yield assertTrue(evaluated)
+      }
+    )
   )
 
   def functionIOGen: Gen[Any, String => ZIO[Any, Throwable, Int]] =
